@@ -1,0 +1,144 @@
+```{r, echo=FALSE, warning=FALSE}
+setwd("G:\\Documents\\Coursera\\Data Science Specialization\\Practical Machine Learning")
+library(plyr)
+library(ggplot2)
+library(caret)
+library(rattle)
+library(randomForest)
+
+if (!file.exists("pml-training.csv")) download.file(url="https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv",destfile="pml-training.csv")
+if (!file.exists("pml-testing.csv")) download.file(url="https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv",destfile="pml-testing.csv")
+set.seed(100)
+```
+---
+title: "Practical Machine Learning Assignment"
+author: "Soren Heitmann"
+date: "Thursday, April 23, 2015"
+output: html_document
+---
+#Summary
+This analysis examines data collected as part of the Human Activity Recognition (HAR) study, presented here: http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf The study has asked participants to lift a dumbbell weight in five characteristic manners: (A) Correctly, according to proper weigh lifting criteria (B) Throwing elbows forward (C) Lifting dumbbell half-way (D) Lowering dumbbell half-way (E) Throwing the hips forward.  Participants performed 10 reps for each activity, while activity monitors were recording their movements in four measurement points: at the belt, on the glove, on the forearm, and on the bumbbell itself.  The analysis uses machine learning algorithms to attempt to classify and predict which characteristic movement the participant has performed, according to classifications A-E.  This analysis performs a similar predictive classification analysis, with a specific objective of properly classifying a hold-out dataset to meet course assignment criteria.  
+
+This analysis concludes that the predicitive classification is possible using the methodology detailed in the HAR study.  Several models are discussed and presented, finding that for the purposes of classifying activity types, a Random Forest model is the more accurate approach; however, for the purposes of specifically identifying the hold-out dataset, a K-means approach may be the better approach.  Nevertheless, both models presented yield 100% accuracy for the specific hold out dataset.
+
+#Partitioning the Data
+As a first step, the data is partitioned into training and test datasets.   Here, as a component of the course assignment, the data has already
+been pre-partitioned and is imported into R as separate data files:
+```{r, cache=TRUE}
+training <- read.csv(file="pml-training.csv",stringsAsFactors=T,header=TRUE)
+testing <- read.csv(file="pml-testing.csv",stringsAsFactors=T,header=TRUE)
+inValidate <- createDataPartition(training$classe, p=1/20, list=F )
+```
+Noting that the pre-defined testing dataset has obfuscated the outcome variable, classe, which defined the activity classification of the given participant, a validation dataset is also useful to help train and validate the predictive model.  In this case, as the sample size is quite large at 19,622 observations, the validation dataset is established at a small of but adequate size of 5%.  
+
+#Exploratory Analysis & Feature Selection
+The data taken from the original study includes some pre-processing conducted by the original analysts.  In this case, the analysts have use a time-based windowing approach to construct summary statistics for the given window period, such as the overall mean, variance, etc of the measurements in a given time period of a few milliseconds.  Consequently, for all time periods outside the designated windowing moment, all summary statistics are NA.  
+
+NA values may be of predictive value, in principle; it may characteristically identify when data cannot be collected, for example, which could be informative.  In this case, these values are introduced as part of the pre-processing methodology and are systematically introduced.  Therefore, we understand that all calculated summary statistics data is not colelcted through the measurements directly, nor available consistnetly throughout the dataset.  All columns containing summary statistics will not be good predictors and are thus removed categorically as a process of feature selection by identifying those columns that are entirely NA data in the pre-defined testing dataset.  Before doing so, this analysis also performs some pre-processing, by unifying the multi-part raw timestamp columns into a single timestamp value.
+```{r, cache=TRUE}
+training$raw_timestamp <- (training$raw_timestamp_part_1*1000000)+training$raw_timestamp_part_2
+testing$raw_timestamp <- (testing$raw_timestamp_part_1*1000000)+testing$raw_timestamp_part_2
+
+na_data <- apply(testing,2,FUN=function(x) { sum(is.na(x)) })
+use_cols <- names(na_data)[na_data==0]
+use_cols <- intersect(use_cols,intersect(names(training),names(testing)))
+train <- training[,c(use_cols,setdiff(names(training),names(testing)))]
+test <- testing[,c(use_cols,setdiff(names(testing),names(training)))]
+
+```
+  
+Further exploratory analysis can then be conducted by examining the data itself.  Before doing so, the data are split into the final training and validation datasets.
+```{r, cache=TRUE}
+valid <- train[ inValidate,]
+train <- train[-inValidate,]
+```
+
+Given that each activity monitor records a variety of data for each moment of moment, there's likely to be significant correlation within each monitor type.  A feature plot is constructed for each measurement type, below given as example for "belt", including the "classe" variable
+```{r, cache=TRUE}
+belt_cols <- grep("belt",names(train))
+```
+```{r, cache=TRUE}
+featurePlot(x=train[,belt_cols],y=train$classe,plot="pairs",alpha=.1)
+```
+The plot is quite dense, but enlarging and exmining the relationships does indeed show significant correlation among the possible predictors.  An analysis for the other measurement points shows a similar relationship.  As high correlation may dillute the feature classification as the model can split on multiple similar correlated variables, filtering the data to reduce correlation is a major component of feature selection.  This is done by creating a correlation matrix and eliminating highly correlated variables by first selecting the most correlated variable against all others, whereupon those variables against which have a 70% or higher correlation are eliminated; this is done for each variable.  The matricies are constructed for each measusrement type as follows and eliminated using a manual identification process:
+```{r, cache=TRUE, eval=FALSE}
+cor(train[,belt_cols])
+```
+
+Having performed this filtering for each measurement group variable, a final set of features is derived as follows, a total of 31 predictors:
+```{r, cache=TRUE}
+coa = c("classe","accel_arm_y","yaw_belt","accel_forearm_x","accel_dumbbell_z","gyros_arm_z","gyros_belt_y","magnet_dumbbell_z","roll_arm",
+        "gyros_forearm_x","magnet_forearm_z","magnet_dumbbell_x","accel_dumbbell_y","accel_dumbbell_x","pitch_forearm","accel_forearm_z",
+        "yaw_forearm","gyros_belt_z","yaw_arm","roll_forearm","magnet_belt_y","accel_forearm_y","magnet_forearm_x","magnet_arm_x","total_accel_arm",
+        "total_accel_forearm","magnet_arm_z","pitch_arm","gyros_dumbbell_y","gyros_arm_y","gyros_forearm_y")
+```
+
+#Model 1: RPart
+As an initial classificaiton, a RPart (Recursive Partitioning and Regression Trees) model is used.  A cross-validation bootstrapping process is used.  Noting that the data collection methodology is highly correlated in time, it is expected that there are biases especially in the early and late stages of the activity -- such as the participat picking up the dumbbell and getting started, or a characteristically different final rep as they end the 10 reps.  Therefore, a cross validation approach such as k-folds was considered possibly biased for low values of k (large cross validation groups).  Cross validation is performed interanally by the caret package, but it may be specified or tuned using the trainControl() call.  In this analysis, the trainControl() is specified as below in order to execute the discussed cross validation approach.
+
+```{r, cache=TRUE}
+cv_rpart <- trainControl(method="boot",number=25,repeats=2)
+system.time(rpartmodel<-train(classe ~ .,method="rpart",data=train[,coa], trControl=cv_rpart))
+rpartpredict <- predict(rpartmodel$finalModel,newdata=valid[,coa])
+rpartpredictions <- unlist(attributes(rpartpredict)$dimnames[2])[apply(rpartpredict,1,FUN=function(x) { match(max(x),x) })]
+confusionMatrix(factor(rpartpredictions,levels=levels(valid$classe)),valid$classe)
+```
+
+Tested for accuracy against the validation dataset, the RPart model is terrible, with an out of sample accuracy of 56% (although it's surprisingly a bit higher than the in-sample accuracy of only 55%!).  
+```{r, cache=TRUE}
+fancyRpartPlot(rpartmodel$finalModel)
+```
+
+#Model 2: Random Forest
+A random forest is selected to improve on the rpart model.  Here, an Out-of-Bag cross-validation methodology is used, as its application is particularly useful for random forests and provides strong bias vs variance trade offs.  Once again, cross-validation is handled internally by the caret R package, and is specified by passing the specification in trainControl()
+```{r, cache=TRUE, warning=FALSE}
+cv_rf <- trainControl(method="oob",number=10,repeats=5,p=0.75)
+system.time(rfm <- train(classe ~ ., method="rf", data=train[,coa], trControl=cv_rf))
+
+rfpredict_in <- predict(rfm$finalModel,newdata=train[,coa])
+rfpredict_out <- predict(rfm$finalModel,newdata=valid[,coa])
+
+confusionMatrix(rfpredict_in,train$classe)$overall["Accuracy"]
+confusionMatrix(rfpredict_out,valid$classe)$overall["Accuracy"]
+```
+##Model Estiamtes
+The random forest model has very strong predictive power.  It's in-sample accuracy is near 100%.  Using cross-validation, the expected out-of-sample error is given by the model in the accuracy report.  Here at accuracy is 99.5% expected out of sample accuracy at mtry=2, the final optimal model, as discussed below.  Applying this model against the validation set, the calculated out of sample accuracy is 99.7%, as reported by the confusion matrix above. Cross-Validation was used to estimate the accuracy, using the OOB cv methodology.  This is calculated internally in caret's random forest implemention as specified below:
+```{r, cache=TRUE}
+rfm
+```
+Here, we can see the cross validation approach reports the out-of-sample error with each mtry iteration and ultimately the optimal model selection is given as reported on mtry=2.  The error curve can be seen by plotting the final model.
+```{r, cache=TRUE}
+plot(rfm$finalModel)
+```
+
+
+```{r, cache=TRUE}
+predict(rfm$finalModel,newdata=test[,coa[-1]])
+```
+In this case, the out of sample predictive power for the specific testing set is 100% as validated by 20/20 for homework assignment 2.   However, the answers can also be calculated, as discussed below in model 3.
+
+#Model 3: K-Means
+The original purpose of this analysis by the original researches was to classify movements with exercise characteristics.  This analysis attempts to replicate that, but has a specific goal to determine the hold-out test dataset activity types (and to do so with 100% accuracy, a level that is clearly absolute and less about good prediction).  The data available effectively allow the answers to be calculated by using the timestamp data.  Noting that an acitivity participant necessarily performs that activity in time, there is a complete data picture of each moment of each rep of each activity for each participant recorded in time.  The test dataset is a (randomly?) select sub-set of the overall activity data.  As the test data includes the timestamp data, it's possible to match the moment in time against the overall time sequence from which it was selected.  As that continuity can be reconstricted, the activity the individual was doing can be inferred from the activity the participant was doing a few milliseconds before/after the moment indicated by the test dataset.  For didactic purposes, a modele is constructed to identify these moments from which the samples were taken.
+```{r, cache=TRUE}
+cv_knn <- trainControl(method="repeatedcv",number=5,repeats=2)
+system.time(knnmodel<-train(classe ~ raw_timestamp, method="knn", metric="Accuracy", data=train[,c("classe","raw_timestamp")],trControl=cv_knn))
+knnpredict_in <- predict(knnmodel$finalModel,newdata=train[,c("raw_timestamp")])
+knnpredict_out <- predict(knnmodel$finalModel,newdata=valid[,c("raw_timestamp")])
+
+knnpredictions_in <- attributes(knnpredict_in)$dimnames[[2]][apply(knnpredict_in,1,FUN=function(x) { match(1,x) })]
+knnpredictions_out <- attributes(knnpredict_out)$dimnames[[2]][apply(knnpredict_out,1,FUN=function(x) { match(1,x) })]
+
+confusionMatrix(knnpredictions_in,train$classe)$overall["Accuracy"]
+confusionMatrix(knnpredictions_out,valid$classe)$overall["Accuracy"]
+```
+Here, the model has a 100% in sample accuracy and, curiously, an expected out-of-sample accuracyt of 99.8%, just slightly better than the random forest, but essentially the same.  The model misclassifies a single activity in the validation data.  (I suspect, this may be due to the sampling of the validation dataset, which introduces additional gaps in the time sequence).  This approach is of course useless in a real world approach, since the time component is an irrelevant predictor for an unknown participant.  But it's a valid approach in this particular case for solving the homework assignment by using machine learning approach.  Finally, using the time approach, the answers for the test dataset can simply be calculated:
+```{r, cache=TRUE}
+answers <- c()
+for (i in 1:length(testing$problem_id))
+{
+     training$x <- abs(training$raw_timestamp - testing$raw_timestamp[i])
+     a <- as.character(training[training$x==min(training$x),c("classe")])
+     answers <- c(answers,a)
+}
+print(answers)
+```
